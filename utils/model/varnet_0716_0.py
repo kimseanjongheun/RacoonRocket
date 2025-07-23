@@ -236,15 +236,17 @@ class VarNet(nn.Module):
         )
 
     def forward(self, masked_kspace: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        result_list = []
         sens_maps = self.sens_net(masked_kspace, mask)
         kspace_pred = masked_kspace.clone()
 
         for cascade in self.cascades:
             kspace_pred = cascade(kspace_pred, masked_kspace, mask, sens_maps) # 각 cascade에는 VarnetBlock이 들어간다
-        
-        result = fastmri.rss(fastmri.complex_abs(fastmri.ifft2c(kspace_pred)), dim=1)
-        result = center_crop(result, 384, 384)
-        return result
+            result = fastmri.rss(fastmri.complex_abs(fastmri.ifft2c(kspace_pred)), dim=1)
+            result = center_crop(result, 384, 384) 
+            result_list.append(result)
+
+        return result_list
 
 
 class VarNetBlock(nn.Module):

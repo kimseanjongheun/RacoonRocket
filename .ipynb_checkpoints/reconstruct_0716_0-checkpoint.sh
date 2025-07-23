@@ -1,7 +1,7 @@
 #!/bin/bash
-python reconstruct.py \
+python reconstruct_0716_0.py \
   -b 1 \
-  -n 'Varnet_test' \
+  -n 'Varnet_0716_0' \
   -p '/root/Data/leaderboard' \
   --cascade 6 \
   --chans 8 \

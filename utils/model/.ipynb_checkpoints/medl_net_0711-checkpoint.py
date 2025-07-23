@@ -14,8 +14,50 @@ import torch.nn as nn
 import torch.nn.functional as F
 from fastmri.data import transforms
 
+from unet_for_medl import UnetModel2d
 from unet import Unet
 from utils.common.utils import center_crop
+from mri_transforms_medl import *
+
+
+class gd(nn.Module): # DC block에 대응한다.
+    def __init__(self):
+        super(gd, self).__init__()
+        self._coil_dim = 1
+        self._complex_dim = -1
+        self._spatial_dims = (2, 3)
+        self.lambda_step = nn.Parameter(torch.Tensor([0.5]))
+
+    def _forward_operator(self, image, sampling_mask, sensitivity_map):  # PFS
+        forward = torch.where(
+            sampling_mask == 0,
+            torch.tensor([0.0], dtype=image.dtype).to(image.device),
+            fft2_2c(expand_operator(image, sensitivity_map, self._coil_dim), dim=self._spatial_dims),
+        )
+        return forward
+
+    def _backward_operator(self, kspace, sampling_mask, sensitivity_map):  # (PFS)^(-1)
+        backward = reduce_operator(
+            ifft2_2c(
+                torch.where(
+                    sampling_mask == 0,
+                    torch.tensor([0.0], dtype=kspace.dtype).to(kspace.device),
+                    kspace,
+                ),
+                self._spatial_dims,
+            ),
+            sensitivity_map,
+            self._coil_dim,
+        )
+        return backward
+
+    def forward(self, kspace_pred, masked_kspace, mask, sens_maps):
+        Ax = self._forward_operator(kspace_pred, mask, sens_maps)
+        ATAx_y = self._backward_operator(Ax - masked_kspace, mask, sens_maps)
+        r = kspace_pred - self.lambda_step * ATAx_y
+
+        return r
+
 
 
 class NormUnet(nn.Module):
@@ -67,18 +109,31 @@ class NormUnet(nn.Module):
     def norm(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # group norm
         b, c, h, w = x.shape
-        x = x.view(b, 2, c // 2 * h * w)
+        # 복소수 채널로 나눈다고 가정 (e.g. real+imag)
+        assert c % 2 == 0, "Channel 수는 반드시 짝수여야 합니다 (real + imag)"
 
-        mean = x.mean(dim=2).view(b, c, 1, 1)
-        std = x.std(dim=2).view(b, c, 1, 1)
+        # group: [b, 2, c//2, h, w]
+        x_group = x.view(b, 2, c // 2, h, w)
 
-        x = x.view(b, c, h, w)
+            # flatten each group
+        x_flat = x_group.view(b, 2, -1)  # shape: [b, 2, c//2 * h * w]
+        # 평균과 표준편차 계산
+        mean = x_flat.mean(dim=2, keepdim=True)  # shape: [b, 2, 1]
+        std = x_flat.std(dim=2, keepdim=True)    # shape: [b, 2, 1]
+        # broadcasting을 위해 shape 복원
+        mean = mean.view(b, 2, 1, 1, 1)           # [b, 2, 1, 1, 1]
+        std = std.view(b, 2, 1, 1, 1)
+        # normalize
+        x_normed = (x_group - mean) / (std + 1e-8)
+        # 다시 원래 shape로 복원
+        x_out = x_normed.view(b, c, h, w)
+        return x_out, mean.view(b, 2, 1, 1), std.view(b, 2, 1, 1)
 
-        return (x - mean) / std, mean, std
 
     def unnorm(
         self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
     ) -> torch.Tensor:
+
         return x * std + mean
 
     def pad(
@@ -108,16 +163,15 @@ class NormUnet(nn.Module):
         return x[..., h_pad[0] : h_mult - h_pad[1], w_pad[0] : w_mult - w_pad[1]]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.shape[-1] == 2:
-            raise ValueError("Last dimension must be 2 for complex.")
-
+        # x 변수가 끝부분이 (real, image, real, image .. 4 + 2 * i 개 존재함)
+        # 얘를 앞쪽으로 바꿔주면 될듯?
         # get shapes for unet and normalize
         x = self.complex_to_chan_dim(x)
         x, mean, std = self.norm(x)
         x, pad_sizes = self.pad(x)
 
         x = self.unet(x)
-
+        
         # get shapes back and unnormalize
         x = self.unpad(x, *pad_sizes)
         x = self.unnorm(x, mean, std)
@@ -201,7 +255,7 @@ class SensitivityModel(nn.Module):
         return x
 
 
-class VarNet(nn.Module):
+class MedlNet(nn.Module):
     """
     A full variational network model.
 
@@ -211,7 +265,8 @@ class VarNet(nn.Module):
 
     def __init__(
         self,
-        num_cascades: int = 12,
+        num_cascades: int = 9,
+        iterations=(3, 3, 3),
         sens_chans: int = 8,
         sens_pools: int = 4,
         chans: int = 18,
@@ -231,23 +286,39 @@ class VarNet(nn.Module):
         super().__init__()
 
         self.sens_net = SensitivityModel(sens_chans, sens_pools)
-        self.cascades = nn.ModuleList(
-            [VarNetBlock(NormUnet(chans, pools)) for _ in range(num_cascades)]
+        self.cascades = nn.ModuleList()
+        if isinstance(iterations, int):
+            self.cascades.append(MedlNetBlock(iters=iterations))
+        else:
+            for i in range(len(iterations)):
+                self.cascades.append(MedlNetBlock(iters=iterations[i]))
+
+    def sens_reduce(self, x: torch.Tensor, sens_maps: torch.Tensor) -> torch.Tensor:
+        x = fastmri.ifft2c(x)
+        return fastmri.complex_mul(x, fastmri.complex_conj(sens_maps)).sum(
+            dim=1, keepdim=True
         )
 
-    def forward(self, masked_kspace: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def sens_expand(self, x: torch.Tensor, sens_maps: torch.Tensor) -> torch.Tensor:
+        return fastmri.fft2c(fastmri.complex_mul(x, sens_maps))
+
+    def forward(self, masked_kspace: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:        
         sens_maps = self.sens_net(masked_kspace, mask)
         kspace_pred = masked_kspace.clone()
+        out_list = []
+        for cascade in self.cascades:            
+            kspace_pred = cascade(kspace_pred, masked_kspace, mask, sens_maps) + kspace_pred
 
-        for cascade in self.cascades:
-            kspace_pred = cascade(kspace_pred, masked_kspace, mask, sens_maps) # 각 cascade에는 VarnetBlock이 들어간다
-        
-        result = fastmri.rss(fastmri.complex_abs(fastmri.ifft2c(kspace_pred)), dim=1)
-        result = center_crop(result, 384, 384)
-        return result
+            # inter_kspace_pred = self.sens_reduce(image_pred.unsqueeze(dim=1), sens_maps)
+            x = fastmri.rss(fastmri.complex_abs(fastmri.ifft2c(kspace_pred)), dim=1)
+            x = center_crop(x, 384, 384)
+            out_list.append(x)
+            
+        return out_list # list 변수임
 
 
-class VarNetBlock(nn.Module):
+
+class MedlNetBlock(nn.Module):
     """
     Model block for end-to-end variational network.
 
@@ -256,16 +327,33 @@ class VarNetBlock(nn.Module):
     the full variational network.
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, iters=3):
         """
         Args:
             model: Module for "regularization" component of variational
                 network.
         """
         super().__init__()
+        self.iters = iters
+        self.cnn = nn.ModuleList()
+        self.gd_blocks = nn.ModuleList()
+        for i in range(self.iters):
+            self.cnn.append(UnetModel2d(
+                        in_channels=4+i*2,
+                        out_channels=2,
+                        num_filters=18,
+                        num_pool_layers=4,
+                        dropout_probability=0.0,
+                    ))
+            self.gd_blocks.append(gd())
+        self.reg = UnetModel2d(
+                        in_channels=2,
+                        out_channels=2,
+                        num_filters=18,
+                        num_pool_layers=4,
+                        dropout_probability=0.0,
+                    )
 
-        self.model = model
-        self.dc_weight = nn.Parameter(torch.ones(1))
 
     def sens_expand(self, x: torch.Tensor, sens_maps: torch.Tensor) -> torch.Tensor:
         return fastmri.fft2c(fastmri.complex_mul(x, sens_maps))
@@ -275,18 +363,24 @@ class VarNetBlock(nn.Module):
         return fastmri.complex_mul(x, fastmri.complex_conj(sens_maps)).sum(
             dim=1, keepdim=True
         )
+    def complex_to_chan(self, x):
+        # x: [B, C, H, W, 2] → [B, 2*C, H, W]
+        return x.permute(0, 4, 1, 2, 3).reshape(x.size(0), 2 * x.size(1), x.size(2), x.size(3))
 
-    def forward(
-        self,
-        current_kspace: torch.Tensor,
-        ref_kspace: torch.Tensor,
-        mask: torch.Tensor,
-        sens_maps: torch.Tensor,
-    ) -> torch.Tensor:
-        zero = torch.zeros(1, 1, 1, 1, 1).to(current_kspace)
-        soft_dc = torch.where(mask, current_kspace - ref_kspace, zero) * self.dc_weight
-        model_term = self.sens_expand(
-            self.model(self.sens_reduce(current_kspace, sens_maps)), sens_maps
-        )
+    def forward(self, kspace_pred, ref_kspace, mask, sens_maps): # x: image_pred of MedlNet
+        gds = []
+        current_x = kspace_pred
 
-        return current_kspace - soft_dc - model_term
+        x = self.sens_reduce(current_x, sens_maps)
+        x = x.squeeze(dim=1)
+        
+        for i in range(self.iters):
+                    
+            x = self.gd_blocks[i](x, ref_kspace, mask, sens_maps)  
+            gds.append(x)
+            x = self.cnn[i](torch.cat((x, *gds), dim=-1))
+
+        result = self.reg(x)
+        result = result.unsqueeze(dim=1)
+        result = self.sens_expand(result, sens_maps)
+        return result

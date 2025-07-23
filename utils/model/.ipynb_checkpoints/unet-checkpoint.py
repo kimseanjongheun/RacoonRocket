@@ -76,11 +76,11 @@ class Unet(nn.Module):
         output = image
 
         # apply down-sampling layers
-        for layer in self.down_sample_layers:        
-            output = layer(output)       
+        for layer in self.down_sample_layers:
+            output = layer(output)
             stack.append(output)
             output = F.avg_pool2d(output, kernel_size=2, stride=2, padding=0) # avg_pool2d를 사용했다.
-            
+
         output = self.conv(output)
 
         # apply up-sampling layers
@@ -147,7 +147,6 @@ class ConvBlock(nn.Module):
         Returns:
             Output tensor of shape `(N, out_chans, H, W)`.
         """
- 
         return self.layers(image)
 
 
